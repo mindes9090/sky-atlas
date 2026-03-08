@@ -46,6 +46,7 @@ from backtest.engine import Backtester, print_report
 from claude_agent.analyzer import ClaudeAnalyzer
 from sentiment.news import SentimentAnalyzer
 from ml.signal_model import SignalModel, AssetProfile
+from alerts.telegram import TelegramAlerter
 
 # Logging setup
 logging.basicConfig(
@@ -114,12 +115,20 @@ class CryptoTradingBot:
             flash_crash_4h_pct=config.FLASH_CRASH_4H_PCT,
         )
         self.sentiment = SentimentAnalyzer(use_live_api=True)
+        self.telegram = TelegramAlerter(
+            bot_token=config.TELEGRAM_BOT_TOKEN,
+            chat_id=config.TELEGRAM_CHAT_ID,
+        )
 
         self.last_daily_reset = date.today()
         self.last_exit_time: dict[str, datetime] = {}  # Cooldown tracking per symbol
         self.failed_symbols: dict[str, datetime] = {}  # Cooldown for failed orders
         self.COOLDOWN_SECONDS = 48 * 3600  # 48 bars * 1h = 2 days (matches backtest)
         self.FAILED_COOLDOWN_SECONDS = 3600  # 1h cooldown after failed order
+        self.last_heartbeat_hour = -1  # Track heartbeat (every 3 hours)
+
+        # BTC regime state (updated each scan cycle)
+        self.btc_regime_bullish = True  # Default: allow full trading
 
         # Scan real account balance and use it for position sizing
         self._sync_balance()
@@ -194,6 +203,8 @@ class CryptoTradingBot:
         crash_alert = self.black_swan.check_multi_asset(all_returns)
         if crash_alert.action == BlackSwanAction.CLOSE_ALL:
             logger.warning(f"MULTI-ASSET CRASH: {crash_alert.reason}")
+            self.telegram.alert(f"MULTI-ASSET CRASH: {crash_alert.reason}\n"
+                                f"Closing all {len(self.executor.positions)} positions!")
             for sym in list(self.executor.positions.keys()):
                 if sym in symbol_data:
                     price = symbol_data[sym]["close"].iloc[-1]
@@ -202,14 +213,48 @@ class CryptoTradingBot:
                         self._record_closed_trade(result)
             return
 
+        # BTC regime switch: detect if BTC is in bull/bear/chop
+        self._update_btc_regime(symbol_data)
+
+        # Heartbeat (every 3 hours: 0, 3, 6, 9, 12, 15, 18, 21 UTC)
+        current_hour = datetime.utcnow().hour
+        if current_hour % 3 == 0 and current_hour != self.last_heartbeat_hour:
+            self.last_heartbeat_hour = current_hour
+            self.telegram.heartbeat(
+                positions=len(self.executor.positions),
+                equity=self.risk_manager.current_equity,
+            )
+
         for symbol, df in symbol_data.items():
             try:
                 self._process_symbol_v2(symbol, df)
             except Exception as e:
                 logger.error(f"Error processing {symbol}: {e}", exc_info=True)
 
+    def _update_btc_regime(self, symbol_data: dict):
+        """Determine BTC regime to gate alt exposure."""
+        btc_df = symbol_data.get("BTC/USDT")
+        if btc_df is None or len(btc_df) < 200:
+            self.btc_regime_bullish = True
+            return
+
+        curr = btc_df.iloc[-1]
+        price = curr["close"]
+        ema200 = curr.get("ema_200", price)
+        adx = float(curr.get("adx", 20))
+
+        # Bull: price above EMA200 and some trend strength
+        # Bear/chop: price below EMA200 OR ADX < 15
+        self.btc_regime_bullish = (price > ema200) and (adx > 15)
+
+        if not self.btc_regime_bullish:
+            logger.info(f"[BTC REGIME] Bear/chop — reducing max positions to "
+                        f"{config.BTC_REGIME_MAX_POSITIONS}")
+        else:
+            logger.info(f"[BTC REGIME] Bullish — full trading enabled")
+
     def _process_symbol_v2(self, symbol: str, df: pd.DataFrame):
-        """Live trading with v6 Donchian breakout (matches backtest logic)."""
+        """Live trading with v7 Donchian breakout + enhanced filters."""
         profile = AssetProfile.get(symbol)
         price = df["close"].iloc[-1]
         atr_v = df["atr"].iloc[-1] if "atr" in df.columns else price * 0.02
@@ -221,6 +266,7 @@ class CryptoTradingBot:
                 result = self.executor._close_position(symbol, price, "black_swan")
                 if result:
                     self._record_closed_trade(result)
+                    self.telegram.alert(f"Black swan exit: {symbol} @ ${price:.4f}")
             return
 
         # 2. Regime detection (for logging and position sizing)
@@ -228,8 +274,10 @@ class CryptoTradingBot:
         logger.info(f"[{symbol}] Regime: {regime.regime.value} "
                     f"(conf={regime.confidence:.0%} | ADX={regime.adx:.1f})")
 
-        # 3. Check stops on existing positions
+        # 3. Check stops on existing positions (with adaptive ATR)
         if self.executor.has_position(symbol):
+            # Update adaptive trail multiplier based on current vol regime
+            self._update_adaptive_trail(symbol, df)
             close_result = self.executor.check_stops(symbol, price)
             if close_result:
                 self._record_closed_trade(close_result)
@@ -253,6 +301,17 @@ class CryptoTradingBot:
             if elapsed < self.FAILED_COOLDOWN_SECONDS:
                 return
 
+        # 3d. Time-of-day filter: suppress signals during low-liquidity hours
+        current_hour_utc = datetime.utcnow().hour
+        suppress_start, suppress_end = config.SUPPRESS_HOURS_UTC
+        if suppress_start <= current_hour_utc < suppress_end:
+            return
+
+        # 3e. BTC regime switch: limit positions when BTC is bearish/choppy
+        if not self.btc_regime_bullish:
+            if len(self.executor.positions) >= config.BTC_REGIME_MAX_POSITIONS:
+                return
+
         # 4. Donchian breakout detection (v6 strategy)
         ENTRY_LOOKBACK = 96  # 4-day high/low
         dc_high = df["high"].rolling(ENTRY_LOOKBACK).max()
@@ -265,6 +324,8 @@ class CryptoTradingBot:
         rsi = float(curr.get("rsi", 50))
         adx = float(curr.get("adx", 20))
         ema200 = float(curr.get("ema_200", price))
+        zscore = float(curr.get("zscore", 0))
+        bb_width = float(curr.get("bb_width", 0.1))
 
         breakout_up = (price > prev_dc_high)
         breakout_down = (price < prev_dc_low)
@@ -274,31 +335,75 @@ class CryptoTradingBot:
         # Short: breakout below 96-bar low + confirmed bear (very strict)
         short_ok = breakout_down and price < ema200 * 0.95 and rsi > 25 and adx > 20
 
+        # Per-symbol direction restriction (v7: based on 2yr backtest analysis)
+        allowed = AssetProfile.allowed_direction(symbol)
+        if allowed == "long_only":
+            short_ok = False
+        elif allowed == "short_only":
+            long_ok = False
+
+        # BTC-regime gating (v8): suppress ALL entries for gated symbols in BTC bear/chop
+        if AssetProfile.is_btc_regime_gated(symbol) and not self.btc_regime_bullish:
+            long_ok = False
+            short_ok = False
+
+        # ═══ MEAN REVERSION SUB-STRATEGY (v7) ═══
+        # Fires when breakout is idle — catches oversold bounces in bull regime
+        mean_rev_long = False
+        if not long_ok and not short_ok and self.btc_regime_bullish:
+            if (rsi < config.MEAN_REV_RSI_THRESHOLD
+                    and zscore < config.MEAN_REV_ZSCORE_THRESHOLD
+                    and price > ema200 * 0.92):  # Not in freefall
+                mean_rev_long = True
+
         stop_mult = profile["stop_mult"]
         tp_mult = profile["tp_mult"]
 
         # Log signal status
         logger.info(f"[{symbol}] DC: high={prev_dc_high:.2f} low={prev_dc_low:.2f} | "
                     f"Price={price:.2f} EMA200={ema200:.2f} | "
-                    f"RSI={rsi:.1f} ADX={adx:.1f} | "
-                    f"Breakout={'UP' if breakout_up else 'DOWN' if breakout_down else 'NONE'}")
+                    f"RSI={rsi:.1f} ADX={adx:.1f} Z={zscore:.2f} | "
+                    f"Breakout={'UP' if breakout_up else 'DOWN' if breakout_down else 'MR' if mean_rev_long else 'NONE'}")
 
         direction = None
+        reason = ""
         if long_ok:
             direction = "LONG"
             stop_loss = price - stop_mult * atr_v
             take_profit = price + tp_mult * atr_v
             confidence = 0.7
+            reason = "v6 Donchian breakout LONG"
         elif short_ok:
             direction = "SHORT"
             stop_loss = price + stop_mult * atr_v
             take_profit = price - tp_mult * atr_v
             confidence = 0.6
+            reason = "v6 Donchian breakout SHORT"
+        elif mean_rev_long:
+            direction = "LONG"
+            stop_loss = price - config.MEAN_REV_STOP_ATR_MULT * atr_v
+            take_profit = price + config.MEAN_REV_TP_ATR_MULT * atr_v
+            confidence = 0.5  # Lower confidence for mean reversion
+            reason = f"v7 Mean reversion LONG (RSI={rsi:.0f} Z={zscore:.1f})"
         else:
             return
 
-        logger.info(f"[{symbol}] {direction} BREAKOUT signal | "
-                    f"RSI={rsi:.1f} ADX={adx:.1f}")
+        # ═══ FUNDING RATE FILTER (v7) ═══
+        # Suppress entries when market is overcrowded in one direction
+        try:
+            funding_rate = self.fetcher.fetch_funding_rate(symbol)
+            if direction == "LONG" and funding_rate > config.FUNDING_RATE_LONG_MAX:
+                logger.info(f"[{symbol}] Funding rate {funding_rate:.6f} too high — "
+                            f"suppressing LONG")
+                return
+            if direction == "SHORT" and funding_rate < config.FUNDING_RATE_SHORT_MIN:
+                logger.info(f"[{symbol}] Funding rate {funding_rate:.6f} too negative — "
+                            f"suppressing SHORT")
+                return
+        except Exception:
+            pass  # Don't block trading if funding rate fetch fails
+
+        logger.info(f"[{symbol}] {direction} signal | {reason}")
 
         # 5. Position sizing
         regime_mult = self.regime_detector.get_position_size_multiplier(regime)
@@ -320,16 +425,54 @@ class CryptoTradingBot:
             signal=Signal.LONG if direction == "LONG" else Signal.SHORT,
             entry_price=price, stop_loss=stop_loss, take_profit=take_profit,
             atr=atr_v, confidence=confidence,
-            reason=f"v6 Donchian breakout {direction}"
+            reason=reason,
         )
+
+        # Use tighter trailing for mean reversion trades
+        if mean_rev_long:
+            profile = dict(profile)  # Copy to avoid mutating
+            profile["trail_atr_mult"] = config.MEAN_REV_TRAIL_ATR_MULT
+
         self._execute_trade(symbol, direction, trade_signal, pos_size, regime, profile)
+
+    def _update_adaptive_trail(self, symbol: str, df: pd.DataFrame):
+        """Adjust trailing stop multiplier based on current volatility regime.
+        Widens during vol spikes (prevents premature stops),
+        tightens during quiet periods (locks in more profit).
+        """
+        pos = self.executor.get_position(symbol)
+        if not pos or len(df) < 50:
+            return
+
+        atr_14 = df["atr"].iloc[-1]
+        atr_50 = df["atr"].rolling(50).mean().iloc[-1]
+        if atr_50 <= 0:
+            return
+
+        vol_ratio = atr_14 / atr_50
+        profile = AssetProfile.get(symbol)
+        base_trail = profile["trail_atr_mult"]
+
+        if vol_ratio > config.ATR_VOL_RATIO_HIGH:
+            # High vol: widen trail to avoid premature stop-outs
+            new_trail = base_trail * (1 + config.ATR_ADAPTIVE_WIDEN)
+        elif vol_ratio < config.ATR_VOL_RATIO_LOW:
+            # Low vol: tighten trail to lock in profits
+            new_trail = base_trail * (1 - config.ATR_ADAPTIVE_TIGHTEN)
+        else:
+            new_trail = base_trail
+
+        if abs(new_trail - pos.trail_atr_mult) > 0.05:
+            logger.info(f"[{symbol}] Adaptive trail: {pos.trail_atr_mult:.2f} -> "
+                        f"{new_trail:.2f} (vol_ratio={vol_ratio:.2f})")
+            pos.trail_atr_mult = new_trail
+            self.executor._save_positions()
 
     def _execute_trade(self, symbol, direction, trade_signal, pos_size, regime, profile):
         logger.info(f"[{symbol}] {direction} SIGNAL | {trade_signal.reason}")
         logger.info(f"[{symbol}] Size: {pos_size.units:.6f} | "
                     f"Risk: ${pos_size.risk_amount_usd:.2f}")
 
-        # Log trade details (no Claude API call — saves ~$1.5/night)
         rr = abs(trade_signal.take_profit - trade_signal.entry_price) / (
             abs(trade_signal.stop_loss - trade_signal.entry_price) + 1e-10)
         logger.info(f"[{symbol}] {direction} | {trade_signal.reason} | "
@@ -354,6 +497,14 @@ class CryptoTradingBot:
                 "direction": direction,
             }
             self.failed_symbols.pop(symbol, None)
+            # Telegram alert
+            self.telegram.trade_opened(
+                symbol=symbol, direction=direction,
+                entry=trade_signal.entry_price, units=pos_size.units,
+                stop_loss=trade_signal.stop_loss,
+                risk_usd=pos_size.risk_amount_usd,
+                reason=trade_signal.reason,
+            )
         else:
             logger.warning(f"[{symbol}] Order not opened: {result}")
             self.failed_symbols[symbol] = datetime.utcnow()
@@ -375,6 +526,13 @@ class CryptoTradingBot:
         self.risk_manager.open_positions.pop(symbol, None)
         # Record exit time for cooldown
         self.last_exit_time[symbol] = datetime.utcnow()
+        # Telegram alert
+        self.telegram.trade_closed(
+            symbol=symbol, direction=close_result["direction"],
+            entry=close_result["entry"], exit_price=close_result["exit"],
+            net_pnl=close_result["net_pnl"], pnl_pct=close_result["pnl_pct"],
+            reason=close_result.get("reason", ""),
+        )
 
     def _daily_reset_if_needed(self):
         today = date.today()
@@ -383,6 +541,16 @@ class CryptoTradingBot:
             stats = self.risk_manager.get_stats()
             review = self.claude.daily_performance_review(stats)
             logger.info(f"[DAILY REVIEW]\n{review}")
+
+            # Telegram daily summary
+            daily_pnl = self.risk_manager.current_equity - self.risk_manager.daily_start_equity
+            self.telegram.daily_summary(
+                equity=self.risk_manager.current_equity,
+                daily_pnl=daily_pnl,
+                open_positions=len(self.executor.positions),
+                total_trades=len(self.risk_manager.trade_history),
+                drawdown=stats.get("total_drawdown", 0),
+            )
 
             self.risk_manager.reset_daily()
             self.last_daily_reset = today
@@ -411,6 +579,15 @@ def run_backtest():
 
     exchange = ccxt.binance({"enableRateLimit": True})
 
+    # Fetch BTC regime for gated symbols
+    btc_raw = exchange.fetch_ohlcv("BTC/USDT", "1h", limit=2000)
+    btc_df = pd.DataFrame(btc_raw, columns=["timestamp", "open", "high", "low", "close", "volume"])
+    btc_df["timestamp"] = pd.to_datetime(btc_df["timestamp"], unit="ms")
+    btc_df.set_index("timestamp", inplace=True)
+    btc_df = btc_df.astype(float)
+    btc_df = add_all_indicators(btc_df)
+    btc_bull_series = (btc_df["close"] > btc_df["ema_200"]).astype(float)
+
     all_results = {}
 
     for symbol in config.SYMBOLS:
@@ -425,7 +602,8 @@ def run_backtest():
 
             # Generate signals with all features
             profile = AssetProfile.get(symbol)
-            df = _generate_backtest_signals_v2(df, profile, symbol)
+            df = _generate_backtest_signals_v2(df, profile, symbol,
+                                               btc_ema200_series=btc_bull_series)
 
             # Run backtest
             bt = Backtester(
@@ -454,7 +632,8 @@ def run_backtest():
 
 
 def _generate_backtest_signals_v2(
-    df: pd.DataFrame, profile: dict, symbol: str
+    df: pd.DataFrame, profile: dict, symbol: str,
+    btc_ema200_series: pd.Series = None,
 ) -> pd.DataFrame:
     """
     v6 signal generator — Donchian breakout + trend filter.
@@ -491,6 +670,7 @@ def _generate_backtest_signals_v2(
     current_position = None
     entry_price = 0.0
     entry_atr = 0.0
+    entry_trail_mult = trail_mult  # Per-trade trail multiplier
     bars_in_trade = 0
     bars_since_last_exit = 999
     highest_since_entry = 0.0
@@ -519,12 +699,12 @@ def _generate_backtest_signals_v2(
 
             if current_position == "LONG":
                 highest_since_entry = max(highest_since_entry, price)
-                trail_stop = highest_since_entry - trail_mult * entry_atr
+                trail_stop = highest_since_entry - entry_trail_mult * entry_atr
                 fixed_stop = entry_price - stop_mult * entry_atr
                 hit_stop = price <= max(fixed_stop, trail_stop)
             else:
                 lowest_since_entry = min(lowest_since_entry, price)
-                trail_stop = lowest_since_entry + trail_mult * entry_atr
+                trail_stop = lowest_since_entry + entry_trail_mult * entry_atr
                 fixed_stop = entry_price + stop_mult * entry_atr
                 hit_stop = price >= min(fixed_stop, trail_stop)
 
@@ -581,12 +761,37 @@ def _generate_backtest_signals_v2(
             if adx < 20:
                 short_ok = False
 
+        # ═══ PER-SYMBOL DIRECTION RESTRICTION (v7) ═══
+        allowed = AssetProfile.allowed_direction(symbol)
+        if allowed == "long_only":
+            short_ok = False
+        elif allowed == "short_only":
+            long_ok = False
+
+        # ═══ BTC-REGIME GATING (v8) ═══
+        # Suppress ALL entries for gated symbols when BTC is bearish/choppy.
+        # These symbols bleed during BTC sideways — only trade in BTC uptrends.
+        if AssetProfile.is_btc_regime_gated(symbol) and btc_ema200_series is not None:
+            ts = df.index[i]
+            btc_bull = btc_ema200_series.asof(ts)
+            if btc_bull is not None and not np.isnan(btc_bull) and btc_bull < 1.0:
+                long_ok = False
+                short_ok = False
+
+        # ═══ MEAN REVERSION (v7) ═══
+        mean_rev_long = False
+        if not long_ok and not short_ok:
+            zscore = curr.get("zscore", 0)
+            if (rsi < 25 and zscore < -2.0 and price > ema200 * 0.92):
+                mean_rev_long = True
+
         # ═══ ENTRY DECISION ═══
         if long_ok:
             df.iloc[i, sig_col] = 1
             current_position = "LONG"
             entry_price = price
             entry_atr = atr_v
+            entry_trail_mult = trail_mult
             bars_in_trade = 0
             highest_since_entry = price
             lowest_since_entry = price
@@ -596,6 +801,17 @@ def _generate_backtest_signals_v2(
             current_position = "SHORT"
             entry_price = price
             entry_atr = atr_v
+            entry_trail_mult = trail_mult
+            bars_in_trade = 0
+            highest_since_entry = price
+            lowest_since_entry = price
+
+        elif mean_rev_long:
+            df.iloc[i, sig_col] = 1
+            current_position = "LONG"
+            entry_price = price
+            entry_atr = atr_v
+            entry_trail_mult = 1.5  # Tighter trail for mean reversion
             bars_in_trade = 0
             highest_since_entry = price
             lowest_since_entry = price

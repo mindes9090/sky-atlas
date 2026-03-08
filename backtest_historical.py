@@ -63,19 +63,34 @@ def fetch_extended_ohlcv(exchange, symbol, timeframe="1h", days_back=365):
     return df
 
 
-def generate_signals(df, profile, symbol):
+def generate_signals(df, profile, symbol, btc_bull_series=None):
     """v3 signal generator — uses main.py's _generate_backtest_signals_v2."""
     from main import _generate_backtest_signals_v2
 
     # Count longs/shorts from the signal column
-    result_df = _generate_backtest_signals_v2(df, profile, symbol)
+    result_df = _generate_backtest_signals_v2(df, profile, symbol,
+                                               btc_ema200_series=btc_bull_series)
     signals = result_df["signal"]
-    positions = signals.diff().fillna(0)
 
     long_entries = ((signals == 1) & (signals.shift(1) != 1)).sum()
     short_entries = ((signals == -1) & (signals.shift(1) != -1)).sum()
 
     return result_df, int(long_entries), int(short_entries)
+
+
+def fetch_btc_regime(exchange, days_back):
+    """Fetch BTC data and compute bullish regime series (close > EMA200)."""
+    logger.info(f"Fetching BTC regime data ({days_back} days)...")
+    btc_df = fetch_extended_ohlcv(exchange, "BTC/USDT", "1h", days_back=days_back)
+    if len(btc_df) < 200:
+        logger.warning("Not enough BTC data for regime — disabling BTC gating")
+        return None
+    btc_df = add_all_indicators(btc_df)
+    # Boolean series: 1.0 = BTC bullish (close > EMA200), 0.0 = bearish/chop
+    btc_bull = (btc_df["close"] > btc_df["ema_200"]).astype(float)
+    logger.info(f"BTC regime: {btc_bull.sum():.0f}/{len(btc_bull)} bars bullish "
+                f"({btc_bull.mean()*100:.1f}%)")
+    return btc_bull
 
 
 def main():
@@ -93,6 +108,9 @@ def main():
         print(f"  HISTORICAL BACKTEST — {period_name} ({days} days)")
         print(f"{'='*70}")
 
+        # Fetch BTC regime data once per period (for BTC-regime gating)
+        btc_bull_series = fetch_btc_regime(exchange, days)
+
         all_results = {}
         all_longs = 0
         all_shorts = 0
@@ -109,7 +127,8 @@ def main():
                 df = add_all_indicators(df)
 
                 profile = AssetProfile.get(symbol)
-                df, longs, shorts = generate_signals(df, profile, symbol)
+                df, longs, shorts = generate_signals(df, profile, symbol,
+                                                      btc_bull_series=btc_bull_series)
                 all_longs += longs
                 all_shorts += shorts
 

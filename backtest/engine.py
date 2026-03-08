@@ -189,12 +189,14 @@ class Backtester:
     def __init__(
         self,
         initial_capital : float = 10_000,
-        commission       : float = 0.001,   # 0.1% per trade
-        slippage         : float = 0.0005,  # 0.05%
+        commission       : float = 0.0005,  # 0.05% taker fee (Binance Futures)
+        slippage         : float = 0.0005,  # 0.05% avg slippage
+        funding_per_bar  : float = 0.0000125, # 0.01%/8h on 1h bars (0.01/100/8)
     ):
         self.initial_capital = initial_capital
         self.commission      = commission
         self.slippage        = slippage
+        self.funding_per_bar = funding_per_bar
 
     def run(self, df: pd.DataFrame,
             signal_col: str = "signal") -> PerformanceReport:
@@ -217,6 +219,11 @@ class Backtester:
         trades    = df["position"].diff().fillna(0).abs()
         cost      = trades * (self.commission + self.slippage)
         df["strat_ret"] -= cost
+
+        # ── Funding rate cost (charged while in position) ──
+        in_position = (df["position"] != 0).astype(float)
+        df["strat_ret"] -= in_position * self.funding_per_bar
+
         df["strat_ret"] = df["strat_ret"].fillna(0)
 
         # ── Equity curve ─────────────────────────────────

@@ -37,6 +37,9 @@ QUANTITY_PRECISION = {
     "1000PEPEUSDT": 0, "1000BONKUSDT": 0, "1000FLOKIUSDT": 0, "TRXUSDT": 0,
     "ENAUSDT": 1, "LDOUSDT": 1, "MANAUSDT": 0, "KAVAUSDT": 1,
     "ALGOUSDT": 0, "RUNEUSDT": 1, "GALAUSDT": 0, "FTMUSDT": 0, "MKRUSDT": 3,
+    "PEOPLEUSDT": 0, "BOMEUSDT": 0,
+    # Round 4 additions (kept only 2yr profitable)
+    "MATICUSDT": 0, "DOTUSDT": 1, "CELOUSDT": 0, "STRKUSDT": 1,
 }
 
 # Symbols that need 1000x prefix on Binance Futures
@@ -301,6 +304,10 @@ class OrderExecutor:
         # Send close order to testnet
         api_symbol, api_qty = self._to_api_symbol_qty(symbol, pos.units)
         close_side = "SELL" if pos.direction == "LONG" else "BUY"
+
+        # Round quantity to proper precision (same as open)
+        precision = QUANTITY_PRECISION.get(api_symbol, 1)
+        api_qty = round(api_qty, precision)
 
         result = self._testnet_order({
             "symbol": api_symbol,

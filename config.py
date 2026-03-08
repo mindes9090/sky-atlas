@@ -35,6 +35,7 @@ SYMBOLS = [
     # Core
     "BTC/USDT",
     "ETH/USDT",
+    "SOL/USDT",
     "DOGE/USDT",
     # Original v6 winners
     "NEAR/USDT",
@@ -44,34 +45,35 @@ SYMBOLS = [
     "SUI/USDT",
     "ATOM/USDT",
     "DYDX/USDT",
-    # Scan winners (Mar 2026) — sorted by Sharpe
-    "XRP/USDT",      # +20.8% Sharpe 7.21
-    "ARB/USDT",      # +15.3% Sharpe 4.89
-    "PEPE/USDT",     # +15.5% Sharpe 4.67
-    "HBAR/USDT",     # +13.4% Sharpe 4.65
-    "AAVE/USDT",     #  +9.4% Sharpe 4.59
-    "RENDER/USDT",   # +11.5% Sharpe 4.40
-    "BNB/USDT",      # +11.9% Sharpe 4.20
-    "FLOKI/USDT",    # +13.6% Sharpe 4.14
-    "APT/USDT",      # +14.3% Sharpe 4.13
-    "SHIB/USDT",     # +11.3% Sharpe 4.08
-    "ADA/USDT",      # +10.0% Sharpe 4.04
-    "XLM/USDT",      # +11.2% Sharpe 4.04
-    "BONK/USDT",     #  +7.6% Sharpe 2.70
-    "OP/USDT",       #  +6.4% Sharpe 2.18
-    "WLD/USDT",      #  +4.2% Sharpe 1.77
-    "AVAX/USDT",     #  +3.5% Sharpe 1.68
-    "SEI/USDT",      #  +3.8% Sharpe 1.33
-    # Scan winners (Mar 2026 round 2)
-    "ENA/USDT",      # +25.1% Sharpe 6.93
-    "LDO/USDT",      # +12.1% Sharpe 3.90
-    "MANA/USDT",     # +11.6% Sharpe 3.73
-    "KAVA/USDT",     # +31.3% Sharpe 3.56
-    "ALGO/USDT",     #  +8.7% Sharpe 3.01
-    "RUNE/USDT",     #  +7.2% Sharpe 2.71
-    "GALA/USDT",     #  +6.1% Sharpe 2.42
-    "FTM/USDT",      #  +7.0% Sharpe 2.03
-    "MKR/USDT",      #  +6.2% Sharpe 1.97
+    # Scan winners (round 1-3)
+    "XRP/USDT",
+    "ARB/USDT",
+    "PEPE/USDT",
+    "HBAR/USDT",
+    "AAVE/USDT",
+    "RENDER/USDT",
+    "FLOKI/USDT",
+    "SHIB/USDT",
+    "BONK/USDT",
+    "OP/USDT",
+    "WLD/USDT",
+    "SEI/USDT",
+    "ENA/USDT",
+    "LDO/USDT",
+    "MANA/USDT",
+    "KAVA/USDT",
+    "ALGO/USDT",
+    "RUNE/USDT",
+    "GALA/USDT",
+    "PEOPLE/USDT",
+    "BOME/USDT",
+    # Scan winners (round 4) — kept only 2yr profitable
+    "MATIC/USDT",    # 2yr +9%
+    "DOT/USDT",      # 2yr +8%
+    "CELO/USDT",     # 2yr +20%
+    "STRK/USDT",     # 2yr +29%
+    # Removed: AVAX, APT, ADA, XLM, BNB, MKR, FTM — persistent losers
+    # Removed round 4: COMP, ANKR, MASK, FLOW, NOT, LINK, JTO, PIXEL, TURBO, CHZ, NEIRO, AEVO — 2yr losers
 ]
 
 TIMEFRAME       = "1h"    # Primary timeframe
@@ -82,7 +84,7 @@ CANDLES_LIMIT   = 500     # Number of candles to fetch
 TOTAL_CAPITAL        = 10_000     # USDT starting capital
 MAX_RISK_PER_TRADE   = 0.02       # 2% max risk per trade
 MAX_PORTFOLIO_RISK   = 0.06       # 6% max simultaneous portfolio risk
-MAX_POSITIONS        = 15         # Max open positions (28 pairs in universe)
+MAX_POSITIONS        = 20         # Max open positions (48 pairs in universe)
 LEVERAGE             = 1          # 1x = no leverage
 
 # Kelly Criterion settings
@@ -121,6 +123,34 @@ ML_RETRAIN_EVERY     = 100         # Retrain interval
 REGIME_VOL_WINDOW    = 24
 REGIME_ADX_THRESHOLD = 25
 REGIME_RSI_NEUTRAL   = (40, 60)
+
+# ─── ENHANCED FILTERS (v7) ──────────────────────────────
+# Funding rate filter: suppress entries when market is overcrowded
+FUNDING_RATE_LONG_MAX  = 0.0003   # Suppress longs when funding > 0.03%
+FUNDING_RATE_SHORT_MIN = -0.0003  # Suppress shorts when funding < -0.03%
+
+# Time-of-day filter: suppress signals during low-liquidity hours (UTC)
+SUPPRESS_HOURS_UTC = (3, 6)       # 03:00-05:59 UTC = low liquidity, more fakeouts
+
+# BTC regime switch: reduce exposure when BTC is in bear/chop
+BTC_REGIME_MAX_POSITIONS = 8      # Max positions when BTC is bearish/choppy
+
+# Adaptive ATR trailing: widen/tighten based on volatility regime
+ATR_ADAPTIVE_WIDEN   = 0.25       # Widen trail by 25% when vol ratio > 1.5
+ATR_ADAPTIVE_TIGHTEN = 0.20       # Tighten trail by 20% when vol ratio < 0.7
+ATR_VOL_RATIO_HIGH   = 1.5       # ATR(14)/ATR(50) threshold for high vol
+ATR_VOL_RATIO_LOW    = 0.7       # ATR(14)/ATR(50) threshold for low vol
+
+# Mean reversion sub-strategy
+MEAN_REV_RSI_THRESHOLD = 25       # RSI below this = oversold bounce candidate
+MEAN_REV_ZSCORE_THRESHOLD = -2.0  # Z-score below this = statistically oversold
+MEAN_REV_STOP_ATR_MULT = 1.5     # Tighter stop for mean reversion (quick trades)
+MEAN_REV_TP_ATR_MULT   = 2.5     # Modest TP target
+MEAN_REV_TRAIL_ATR_MULT = 1.5    # Tighter trailing for mean reversion
+
+# Telegram alerts
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 # ─── TECHNICAL INDICATORS ────────────────────────────────
 EMA_FAST     = 12

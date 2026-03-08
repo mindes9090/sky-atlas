@@ -206,6 +206,48 @@ class AssetProfile:
     Different thresholds for BTC (low vol) vs altcoins (high vol).
     """
 
+    # Per-asset direction restrictions based on 2-year backtest analysis.
+    # "both" = longs and shorts allowed
+    # "long_only" = shorts disabled (asset chops too much to short profitably)
+    # "short_only" = longs disabled (rare, only for extreme cases)
+    #
+    # Rationale (2yr backtest, Mar 2024 - Mar 2026):
+    #   ETH shorts:  avg -0.25%/trade, 52% WR → loses despite decent WR (chops)
+    #   AVAX shorts: avg +0.22%/trade, 49% WR → marginal, not worth the risk
+    #   APT shorts:  avg  0.00%/trade, 48% WR → break even, wastes capital
+    #   XLM shorts:  avg -0.38%/trade, 30% WR → terrible
+    #   BONK shorts: avg +0.04%/trade, 50% WR → break even
+    #   BNB shorts:  loses in backtest, choppy price action
+    #   ADA shorts:  loses in backtest over 2yr
+    #   LDO shorts:  loses in backtest over 2yr
+    #   MKR shorts:  loses in backtest over 2yr
+    #
+    #   BOME shorts: avg +1.69%/trade, 67% WR → excellent
+    #   ENA shorts:  avg +1.48%/trade, 62% WR → excellent
+    #   DYDX shorts: avg +2.24%/trade, 71% WR → best in universe
+    #   ALGO shorts: avg +1.34%/trade, 67% WR → excellent
+    #   DOGE shorts: avg +0.38%/trade, 47% WR → decent
+
+    DIRECTION_ALLOWED = {
+        # Long-only: shorts unprofitable over 2 years
+        "BTC/USDT":    "long_only",
+        "ETH/USDT":    "long_only",
+        "BONK/USDT":   "long_only",
+        "LDO/USDT":    "long_only",
+        "JUP/USDT":    "long_only",
+        "FET/USDT":    "long_only",
+        "SUI/USDT":    "long_only",
+        "RUNE/USDT":   "long_only",
+        "SOL/USDT":    "long_only",
+    }
+
+    # BTC-regime gated symbols: only trade when BTC > EMA200 (bullish).
+    # These symbols bleed during BTC sideways — only trade in BTC uptrends.
+    BTC_REGIME_GATED = {
+        "ETH/USDT", "GALA/USDT", "BONK/USDT",
+        "JUP/USDT", "RUNE/USDT",
+    }
+
     PROFILES = {
         # BTC: widest stops — BTC trends slowly but far
         "BTC/USDT": {
@@ -237,3 +279,13 @@ class AssetProfile:
     @classmethod
     def get(cls, symbol: str) -> dict:
         return cls.PROFILES.get(symbol, cls.DEFAULT_ALTCOIN)
+
+    @classmethod
+    def allowed_direction(cls, symbol: str) -> str:
+        """Return 'both', 'long_only', or 'short_only' for this symbol."""
+        return cls.DIRECTION_ALLOWED.get(symbol, "both")
+
+    @classmethod
+    def is_btc_regime_gated(cls, symbol: str) -> bool:
+        """Return True if this symbol should only trade when BTC is bullish."""
+        return symbol in cls.BTC_REGIME_GATED
